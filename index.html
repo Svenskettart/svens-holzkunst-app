@@ -88,11 +88,35 @@ async function openReceipt(item){try{const url=await getDownloadURL(ref(storage,
 function downloadBlob(blob,filename){const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000)}
 function backupJSON(){if(!user)return;const data={format:'svens-holzkunst-daten',version:1,createdAt:new Date().toISOString(),uid:user.uid,records:rows};downloadBlob(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),`Holzkunst-Buchungsdaten-${today()}.json`);notice('backupStatus','Buchungsdaten als JSON bereitgestellt. Diese Datei enthält keine Beleg-PDFs.','success')}
 async function fetchReceiptWithTimeout(path,timeout=20000){
- const url=await Promise.race([getDownloadURL(ref(storage,path)),new Promise((_,reject)=>setTimeout(()=>reject(Error('Zeitüberschreitung beim Downloadlink')),timeout))]);
- const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),timeout);
- try{const response=await fetch(url,{signal:controller.signal,cache:'no-store'});if(!response.ok)throw Error('HTTP '+response.status);const blob=await response.blob();if(blob.size>20*1024*1024)throw Error('Beleg über 20 MB');return await blob.arrayBuffer()}
- finally{clearTimeout(timer)}
+ // SDK-Download nutzt die Firebase-Anmeldung statt eines oeffentlichen Downloadlinks.
+ // Ein einzelner fehlgeschlagener Beleg darf die gesamte Datensicherung nicht blockieren.
+ const item=ref(storage,path);
+ const deadline=(promise,label)=>{
+  let timer;
+  return Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error(label+': Zeitueberschreitung nach '+timeout/1000+' Sekunden')),timeout)})]).finally(()=>clearTimeout(timer));
+ };
+ try{
+  const bytes=await deadline(getBytes(item,20*1024*1024),'Firebase Storage');
+  return bytes;
+ }catch(primary){
+  // Alternativer Download ueber Firebase-URL; bei Browser-CORS kann auch dieser scheitern.
+  try{
+   const url=await deadline(getDownloadURL(item),'Downloadlink');
+   const controller=new AbortController();
+   const timer=setTimeout(()=>controller.abort(),timeout);
+   try{
+    const response=await fetch(url,{signal:controller.signal,cache:'no-store'});
+    if(!response.ok)throw Error('HTTP '+response.status);
+    const blob=await response.blob();
+    if(blob.size>20*1024*1024)throw Error('Beleg ueber 20 MB');
+    return await blob.arrayBuffer();
+   }finally{clearTimeout(timer)}
+  }catch(secondary){
+   throw Error('Firebase SDK: '+(primary.code||primary.message||primary)+'; Linkabruf: '+(secondary.code||secondary.message||secondary));
+  }
+ }
 }
+
 async function backupAll(){
  if(!user||busy)return;
  if(!window.JSZip){notice('backupStatus','ZIP-Bibliothek nicht geladen. Bitte Internetverbindung prüfen.','error');return}
@@ -107,7 +131,7 @@ async function backupAll(){
    if(r.storagePath)paths.add(r.storagePath);
   }
   const zip=new window.JSZip();
-  const meta={format:'svens-holzkunst-backup',version:1,createdAt:new Date().toISOString(),firebaseUid:user.uid,recordCount:snapshotRows.length,receiptCount:paths.size};
+  const meta={format:'svens-holzkunst-backup',version:2,createdAt:new Date().toISOString(),firebaseUid:user.uid,recordCount:snapshotRows.length,receiptCount:paths.size};
   zip.file('manifest.json',JSON.stringify(meta,null,2));
   zip.file('buchungen.json',JSON.stringify(snapshotRows,null,2));
   const missing=[];let i=0;
@@ -119,6 +143,7 @@ async function backupAll(){
    }catch(e){missing.push({path,error:e.code||e.message||'Fehler'})}
   }
   zip.file('fehlende-belege.json',JSON.stringify(missing,null,2));
+  zip.file('SICHERUNGSSTATUS.txt',missing.length?('UNVOLLSTAENDIGE SICHERUNG: '+missing.length+' von '+paths.size+' Belegen fehlen. Siehe fehlende-belege.json.'):('Alle '+paths.size+' referenzierten Belege wurden gesichert. Eine Wiederherstellung wurde nicht getestet.'));
   notice('backupStatus','Erstelle ZIP-Datei …');
   const blob=await zip.generateAsync({type:'blob',compression:'DEFLATE',compressionOptions:{level:5}});
   downloadBlob(blob,`Svens-Holzkunst-Sicherung-${today()}.zip`);
